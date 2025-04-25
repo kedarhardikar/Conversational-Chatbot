@@ -12,36 +12,43 @@ from gtts import gTTS
 from playsound import playsound
 import tempfile
 from PyPDF2 import PdfReader
+import nltk
+nltk.download('punkt')
+from nltk.tokenize import sent_tokenize
 
 # --- Initialization ---
 load_dotenv()
 api_key = os.getenv("GROQ_API_KEY")
 
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-whisper_model = WhisperModel("base", compute_type="int8")
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")   #Convert text to embeddings
+whisper_model = WhisperModel("base", compute_type="int8")  #Convert speech to text
 
-chroma_client = chromadb.Client()  # In-memory ChromaDB instance
-collection = chroma_client.get_or_create_collection(name="my_document_embeddings")
+chroma_client = chromadb.Client()  # In-memory ChromaDB instance, Stores document embeddings temporarily
+collection = chroma_client.get_or_create_collection(name="my_document_embeddings")  #Creates or retrieves a collection
 
-llm = ChatGroq(model="llama3-8b-8192", api_key=api_key)
+llm = ChatGroq(model="llama3-8b-8192", api_key=api_key) #Used to generate answers based on the context retrieved from vector DB.
 
-engine = pyttsx3.init()
-engine.setProperty('voice', engine.getProperty('voices')[0].id)
+engine = pyttsx3.init() #Initializes the pyttsx3 text-to-speech engine.
+engine.setProperty('voice', engine.getProperty('voices')[0].id) #You could also pick a different voice (e.g., male/female, different accents) by changing the index
 
 
 def speak(text, engine_type="gtts"):
-    if engine_type == "gtts":
+    if engine_type == "gtts":   #Uses Google Text-to-Speech.
         tts = gTTS(text=text, lang='en')
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
             temp_path = fp.name
-            tts.save(temp_path)
-        playsound(temp_path)
-        os.remove(temp_path)
-    else:
-        engine.say(text)
+            tts.save(temp_path) #Creates a temporary .mp3 file to store the audio.
+
+        playsound(temp_path)    #Plays the audio
+        os.remove(temp_path)    #cleans up by deleting the file.
+
+
+    else:   # Uses offline system voice.
+        engine.say(text)    #Speaks the text using the offline voice engine (pyttsx3) initialized earlier
         engine.runAndWait()
 
 
+# records voice input, saves it to a .wav file, and uses the Whisper ASR model to transcribe it to text.
 def take_command_whisper():
     CHUNK = 1024
     FORMAT = pyaudio.paInt16
@@ -52,33 +59,51 @@ def take_command_whisper():
 
     p = pyaudio.PyAudio()
     stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
-    frames = [stream.read(CHUNK) for _ in range(0, int(RATE / CHUNK * RECORD_SECONDS))]
+    frames = [stream.read(CHUNK) for _ in range(0, int(RATE / CHUNK * RECORD_SECONDS))] #Reads data chunk by chunk and stores it into a list frames.
+
+
     stream.stop_stream()
     stream.close()
     p.terminate()
 
-    with wave.open(FILENAME, 'wb') as wf:
+    with wave.open(FILENAME, 'wb') as wf:   #Saves the recorded frames into a standard WAV audio file.
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(p.get_sample_size(FORMAT))
         wf.setframerate(RATE)
         wf.writeframes(b''.join(frames))
 
-    segments, _ = whisper_model.transcribe(FILENAME)
+    segments, _ = whisper_model.transcribe(FILENAME)    #Transcribe the .wav file
+    os.remove(FILENAME) #Remove the saved .wav file after transcription
     return " ".join([seg.text for seg in segments]).strip()
 
 
+
+
+def chunk_text(text, chunk_size=200, overlap=40):
+    sentences = sent_tokenize(text)
+    chunks = []
+    for i in range(0, len(sentences), chunk_size - overlap):
+        chunk = " ".join(sentences[i:i + chunk_size])
+        chunks.append(chunk)
+    return chunks
+
+#it's taking uploaded PDFs, extracting text, chunking it, embedding each chunk, and adding it to your ChromaDB collection.
 def embed_uploaded_documents(files):
     for file in files:
         if file.type == "application/pdf":
             reader = PdfReader(file)
             full_text = "\n".join([page.extract_text() or "" for page in reader.pages])
-            chunks = full_text.split("\n")  # simple splitting, you can chunk more smartly
+            
+            chunks = chunk_text(full_text)
             for i, chunk in enumerate(chunks):
                 if chunk.strip():
                     embedding = embedding_model.encode(chunk, convert_to_numpy=True).tolist()
-                    collection.add(documents=[chunk], embeddings=[embedding], ids=[f"doc_{file.name}_{i}"])
-
-
+                    collection.add(
+                        documents=[chunk],
+                        embeddings=[embedding],
+                        ids=[f"doc_{file.name}_{i}"]
+                    )
+                            
 def retrieve_relevant_chunks(query, top_k=5):
     query_embedding = embedding_model.encode(query, convert_to_numpy=True).tolist()
     results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
@@ -103,6 +128,8 @@ You are an AI assistant that provides clear, concise, and informative answers ba
 ### Instructions:
 - Summarize the relevant information from the context to answer the question.
 - Provide a clear, structured, and fact-based response.
+- Answer in 2-3 lines if possible
+- Answer in brief only if necessary
 - If the context does not contain enough information, say \"The provided context does not contain sufficient details.\"
 
 ### Response:
@@ -113,7 +140,7 @@ You are an AI assistant that provides clear, concise, and informative answers ba
 # --- Streamlit App ---
 st.set_page_config(page_title="🎤 Voice Assistant", layout="centered")
 st.title("🎤 Voice Assistant")
-st.write("Upload documents and ask questions via voice or text.")
+st.write("Upload documents to query from and ask questions via voice or text.")
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
@@ -133,16 +160,25 @@ with col1:
         user_query = take_command_whisper()
         st.write(f"You said: {user_query}")
         speak(f"Did you say: {user_query}? Say yes or no.", st.session_state.tts_engine)
-        confirm = take_command_whisper().lower()
-        if "no" in confirm:
-            speak("Okay, please try again.", st.session_state.tts_engine)
-            st.warning("Speech not confirmed. Try again.")
-        else:
-            retrieved_chunks = retrieve_relevant_chunks(user_query)
-            response = generate_answer(user_query, retrieved_chunks, st.session_state.chat_history)
-            st.session_state.chat_history.append({"query": user_query, "response": response})
-            st.markdown(f"<b>Assistant:</b> {response}", unsafe_allow_html=True)
-            speak(response, st.session_state.tts_engine)
+
+        # Loop until the speech is confirmed
+        while True:
+            confirm = take_command_whisper().lower()
+            if "no" in confirm:
+                speak("Okay, please try again.", st.session_state.tts_engine)
+                st.warning("Speech not confirmed. Try again.")
+                user_query = take_command_whisper()  # Re-listen if user says "no"
+                st.write(f"You said: {user_query}")
+                speak(f"Did you say: {user_query}? Say yes or no.", st.session_state.tts_engine)
+            else:
+                # When "yes" is confirmed, proceed with answering
+                retrieved_chunks = retrieve_relevant_chunks(user_query)
+                response = generate_answer(user_query, retrieved_chunks, st.session_state.chat_history)
+                st.session_state.chat_history.append({"query": user_query, "response": response})
+                st.markdown(f"<b>Assistant:</b> {response}", unsafe_allow_html=True)
+                speak(response, st.session_state.tts_engine)
+                break  # Exit the loop once the user confirms
+
 
 with col2:
     if st.button("💬 Continue Conversation"):
